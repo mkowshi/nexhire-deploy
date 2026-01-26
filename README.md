@@ -153,4 +153,4 @@ Follow these steps to set up and run the project locally:
 * **Admin:** Log in using the account created via `create_admin.py`. Use the "Admin Dashboard", navigate to "Manage Jobs" to Approve/Unapprove/Delete postings, navigate to "Manage Users" to View/Edit Verification Status/Delete users.
 
 ## Author
-* [Ram]
+* Kowshi

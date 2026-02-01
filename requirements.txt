@@ -8,8 +8,7 @@ Werkzeug>=2.0
 email-validator>=1.1
 python-dotenv>=0.19
 itsdangerous>=2.0
-psycopg2-binary # For PostgreSQL on Render
-gunicorn        # WSGI server for Render
-uuid            # Built-in, but good to note dependency if explicit import used
+psycopg2-binary
+gunicorn
 whitenoise[brotli]
 cloudinary

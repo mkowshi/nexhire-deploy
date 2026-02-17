@@ -1,10 +1,9 @@
 # --- app/forms.py ---
-# (This file remains unchanged from the previous complete version provided)
 import re
 from datetime import date
 from flask_wtf import FlaskForm
-from wtforms import ( StringField, PasswordField, SubmitField, BooleanField, SelectField, TextAreaField, IntegerField, DateField, FileField)
-from wtforms.validators import ( DataRequired, Length, Email, EqualTo, ValidationError, Optional, NumberRange )
+from wtforms import (StringField, PasswordField, SubmitField, BooleanField, SelectField, TextAreaField, IntegerField, DateField, FileField)
+from wtforms.validators import (DataRequired, Length, Email, EqualTo, ValidationError, Optional, NumberRange)
 from flask_wtf.file import FileRequired, FileAllowed
 from .models import User
 
@@ -14,7 +13,8 @@ def validate_password_complexity(form, field):
     if not re.search("[a-z]", password): raise ValidationError('Needs lowercase.')
     if not re.search("[A-Z]", password): raise ValidationError('Needs uppercase.')
     if not re.search("[0-9]", password): raise ValidationError('Needs digit.')
-    if not re.search("[!@#$%^&*()-_=+\[\]{};:'\",.<>?/]", password): raise ValidationError('Needs special char.')
+    # FIX APPLIED HERE: Added 'r' for raw string to prevent SyntaxWarning
+    if not re.search(r"[!@#$%^&*()-_=+\[\]{};:'\",.<>?/]", password): raise ValidationError('Needs special char.')
 
 class RegistrationForm(FlaskForm):
     username = StringField('Username', validators=[DataRequired(), Length(min=4, max=80)])
@@ -32,7 +32,8 @@ class RegistrationForm(FlaskForm):
 class LoginForm(FlaskForm):
     email = StringField('Email', validators=[DataRequired(), Email()])
     password = PasswordField('Password', validators=[DataRequired()])
-    remember_me = BooleanField('Remember Me'); submit = SubmitField('Login')
+    remember_me = BooleanField('Remember Me')
+    submit = SubmitField('Login')
 
 class RequestResetForm(FlaskForm):
     email = StringField('Email', validators=[DataRequired(), Email()])

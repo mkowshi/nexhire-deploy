@@ -1,27 +1,22 @@
 # --- app/views.py ---
-
 import os
 import uuid
 from functools import wraps
 from datetime import datetime
-from flask import (
-    render_template, redirect, url_for, flash, request, Blueprint, current_app, abort, send_from_directory
-)
+from flask import (render_template, redirect, url_for, flash, request, Blueprint, current_app, abort, send_from_directory)
 from flask_login import login_user, logout_user, login_required, current_user
 from flask_mail import Message
 from itsdangerous import SignatureExpired, BadSignature
 from werkzeug.utils import secure_filename
 from sqlalchemy.orm import joinedload
-# --- Cloudinary Import ---
+# --- V V V --- Cloudinary Import --- V V V ---
 import cloudinary
 import cloudinary.uploader
+# --- ^ ^ ^ --- End Cloudinary Import --- ^ ^ ^ ---
 
 from . import db, mail, serializer
 from .models import User, Job, Application
-from .forms import (
-    RegistrationForm, LoginForm, JobForm, RequestResetForm, ResetPasswordForm, ApplicationForm,
-    RejectApplicationForm
-)
+from .forms import (RegistrationForm, LoginForm, JobForm, RequestResetForm, ResetPasswordForm, ApplicationForm, RejectApplicationForm)
 
 # --- Blueprints ---
 main_bp = Blueprint('main', __name__)
@@ -29,7 +24,6 @@ auth_bp = Blueprint('auth', __name__)
 jobs_bp = Blueprint('jobs', __name__)
 employers_bp = Blueprint('employers', __name__)
 admin_bp = Blueprint('admin', __name__)
-
 
 # --- Decorators for Role Checks ---
 def employer_required(f):
@@ -61,7 +55,6 @@ def job_seeker_required(f):
             return redirect(request.referrer or url_for('main.index'))
         return f(*args, **kwargs)
     return decorated_function
-
 
 # --- Helper Function for Sending Emails ---
 def send_email(subject, recipients, text_body, html_body):
@@ -106,34 +99,38 @@ def register():
         return redirect(url_for('main.index'))
     form = RegistrationForm()
     if form.validate_on_submit():
-        user=User(username=form.username.data, email=form.email.data.lower(), role=form.role.data, company_name=form.company_name.data if form.role.data == 'employer' else None, is_verified=False)
+        user = User(username=form.username.data, email=form.email.data.lower(), role=form.role.data, company_name=form.company_name.data if form.role.data == 'employer' else None, is_verified=False)
         user.set_password(form.password.data)
         db.session.add(user)
         try:
             db.session.commit()
-            current_app.logger.info(f"User registered: {user.username}, sending email.")
+            current_app.logger.info(f"User registered: {user.username}, preparing email.")
             token = serializer.dumps(user.email, salt=current_app.config['SECURITY_PASSWORD_SALT'])
             verify_url = url_for('auth.verify_email', token=token, _external=True)
             subject = "Confirm Email"
             text_body = f"Verify: {verify_url}"
             try:
-                 html_body = render_template('auth/email/verify_email.html', verify_url=verify_url)
+                html_body = render_template('auth/email/verify_email.html', verify_url=verify_url)
             except Exception as template_error:
-                 current_app.logger.error(f"Error rendering verification email template: {template_error}")
-                 html_body = text_body # Fallback
+                current_app.logger.error(f"Error rendering verification email template: {template_error}")
+                html_body = text_body
 
-            if send_email(subject, [user.email], text_body, html_body):
-                flash('Registered! Check email to verify.', 'success')
-            else:
-                flash('Registered, but verification email failed.', 'warning')
-                if not current_app.config.get('MAIL_USERNAME') or not current_app.config.get('MAIL_PASSWORD'):
-                     flash("Email functionality may be disabled due to configuration issues.", "danger")
+            # FIX APPLIED HERE: Restructured email logic to prevent app crash
+            try:
+                mail_success = send_email(subject, [user.email], text_body, html_body)
+                if mail_success:
+                    flash('Registration successful! Check your email to verify.', 'success')
                 else:
-                     flash("Could not connect to the email server.", "danger")
+                    flash('Registered successfully, but we could not connect to the email server.', 'warning')
+            except Exception as e:
+                current_app.logger.error(f"Mail Exception Triggered: {e}")
+                flash('Registered successfully, but the verification email failed to send.', 'warning')
+
             return redirect(url_for('auth.login'))
+
         except Exception as e:
             db.session.rollback()
-            flash(f'Registration error: {e}', 'danger')
+            flash(f'Registration error. Please try again.', 'danger')
             current_app.logger.error(f"Reg error: {e}")
     return render_template('auth/register.html', title='Register', form=form)
 
@@ -172,7 +169,7 @@ def login():
             flash(f'Welcome {user.username}!', 'success')
             current_app.logger.info(f"Login: {user.username}")
             next_page = request.args.get('next')
-            if next_page and next_page.startswith('/'): # Basic security check
+            if next_page and next_page.startswith('/'):
                 return redirect(next_page)
             elif user.role == 'admin':
                 return redirect(url_for('admin.dashboard'))
@@ -211,7 +208,7 @@ def forgot_password():
                 html = render_template('auth/email/reset_password_email.html', reset_url=url)
             except Exception as e:
                 current_app.logger.error(f"Error rendering reset password template: {e}")
-                html = text # Fallback
+                html = text
             if send_email(subject, [user.email], text, html):
                 sent = True
             else:
@@ -244,7 +241,6 @@ def reset_password(token):
         current_app.logger.info(f"Password reset: {user.username}")
         return redirect(url_for('auth.login'))
     return render_template('auth/reset_password.html', title='Reset Password', form=form, token=token)
-
 
 # --- Job Seeker Routes ---
 @jobs_bp.route('/')
@@ -285,73 +281,51 @@ def apply_job(job_id):
     if form.validate_on_submit():
         f = form.resume.data
         filename = secure_filename(f.filename)
-        cloudinary_public_id = None 
+        cloudinary_public_id = None
 
         if not filename:
             flash('Invalid resume filename provided.', 'danger')
             return render_template('jobs/detail.html', title=job.title, job=job, already_applied=False, form=form)
 
-        # --- V V V --- TEMP FILE UPLOAD STRATEGY --- V V V ---
-        temp_path = None
+        # Cloudinary Upload
         try:
-            # 1. Save file to temporary path
-            # This ensures we have the physical file and it's not empty
-            temp_path = os.path.join(current_app.instance_path, filename)
-            f.save(temp_path)
-
-            # 2. Check if file is empty
-            if os.path.getsize(temp_path) == 0:
-                raise Exception("File is empty (0 bytes).")
-
             cld_folder = f"job_portal/resumes/{job.id}"
             unique_id = uuid.uuid4().hex[:12]
-            cld_public_id = f"{unique_id}_{filename}" 
+            cld_public_id = f"{cld_folder}/{unique_id}_{filename}"
 
-            current_app.logger.info(f"Uploading resume from temp path: {cld_public_id}")
-            
-            # 3. Upload from physical path
+            current_app.logger.info(f"Attempting to upload resume to Cloudinary with public_id: {cld_public_id}")
             upload_result = cloudinary.uploader.upload(
-                temp_path, 
-                public_id=cld_public_id, 
-                folder=cld_folder, 
-                resource_type="raw"
+                f, public_id=cld_public_id, folder=cld_folder, resource_type="raw"
             )
 
             if upload_result and upload_result.get('public_id'):
                 cloudinary_public_id = upload_result.get('public_id')
-                current_app.logger.info(f"Resume uploaded successfully: {cloudinary_public_id}")
+                current_app.logger.info(f"Resume uploaded successfully to Cloudinary: {cloudinary_public_id}")
             else:
-                raise Exception(f"Upload failed: {upload_result}")
+                raise Exception(f"Cloudinary upload failed. Result: {upload_result}")
 
         except Exception as e:
-            current_app.logger.error(f"Cloudinary upload error: {e}")
-            flash("Error uploading resume. Please try again.", 'danger')
+            current_app.logger.error(f"Cloudinary upload error for user {current_user.id}, job {job_id}: {e}")
+            flash("Error uploading resume to cloud storage. Please try again.", 'danger')
             return render_template('jobs/detail.html', title=job.title, job=job, already_applied=False, form=form)
-        finally:
-            # 4. Clean up temp file
-            if temp_path and os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except OSError as e:
-                    current_app.logger.error(f"Error removing temp file: {e}")
-        # --- ^ ^ ^ --- END TEMP FILE UPLOAD --- ^ ^ ^ ---
 
         # Create Application Record
         app_record = Application(
             job_id=job.id, job_seeker_id=current_user.id, current_ctc=form.current_ctc.data,
             expected_ctc=form.expected_ctc.data, notice_period_days=form.notice_period_days.data,
             earliest_join_date=form.earliest_join_date.data,
-            resume_public_id=cloudinary_public_id, 
+            resume_public_id=cloudinary_public_id,
             status='Submitted'
         )
         db.session.add(app_record)
         try:
             db.session.commit()
             flash('Application submitted!', 'success')
-            
-            # Email logic
+            current_app.logger.info(f"Application saved: user {current_user.id}, job {job_id}")
             now_time = datetime.utcnow()
-            try: # Seeker Email
+
+            # Send Emails
+            try:
                 subj_seeker = f"Application Received: {job.title}"
                 job_url = url_for('jobs.job_detail', job_id=job.id, _external=True)
                 text_seeker = f"Hello {current_user.username},\n\nYour application for '{job.title}' at {job.company_name} was submitted on {now_time.strftime('%Y-%m-%d %H:%M')} UTC.\nView job: {job_url}\n\nThanks,\nThe Job Portal Team"
@@ -362,8 +336,9 @@ def apply_job(job_id):
                     flash("Confirm email failed to send.", "warning")
             except Exception as e:
                 current_app.logger.error(f"Seeker confirm email error: {e}")
+                flash("Error preparing confirmation email.", "danger")
 
-            try: # Employer Email
+            try:
                 emp = job.employer
                 if emp and emp.email:
                     subj_emp = f"New Application: {job.title}"
@@ -381,12 +356,12 @@ def apply_job(job_id):
         except Exception as e:
             db.session.rollback()
             current_app.logger.error(f"App DB save error: {e}")
-            # Delete uploaded file if DB fails
             if cloudinary_public_id:
                 try:
                     cloudinary.uploader.destroy(cloudinary_public_id, resource_type="raw")
-                except Exception:
-                    pass
+                    current_app.logger.warning(f"Deleted orphaned Cloudinary resume {cloudinary_public_id} after DB error.")
+                except Exception as del_e:
+                    current_app.logger.error(f"Failed to delete orphaned Cloudinary file {cloudinary_public_id}: {del_e}")
             flash(f'Database error submitting application.', 'danger')
             return render_template('jobs/detail.html', title=job.title, job=job, already_applied=False, form=form)
 
@@ -400,8 +375,8 @@ def apply_job(job_id):
 def my_applications():
     page = request.args.get('page', 1, type=int)
     applications_query = Application.query.options(joinedload(Application.job))\
-                                            .filter_by(job_seeker_id=current_user.id)\
-                                            .order_by(Application.applied_at.desc())
+                                        .filter_by(job_seeker_id=current_user.id)\
+                                        .order_by(Application.applied_at.desc())
     applications = applications_query.paginate(page=page, per_page=15, error_out=False)
     return render_template('jobs/my_applications.html', title="My Applications", applications=applications)
 
@@ -424,7 +399,6 @@ def post_job():
             db.session.commit()
             flash('Job posted pending approval.', 'success')
             current_app.logger.info(f"Job posted: {job.id} by {current_user.id}")
-            # Admin Notification
             try:
                 admins = User.query.filter_by(role='admin').all()
                 emails = [a.email for a in admins if a.email]
@@ -494,8 +468,6 @@ def view_applications(job_id):
     reject_form = RejectApplicationForm()
     return render_template('employers/applications.html', title=f'Applications for {job.title}', job=job, applications=applications, reject_form=reject_form)
 
-# download_resume route was removed as files are now on Cloudinary
-
 @employers_bp.route('/applications/<int:application_id>/reject', methods=['POST'])
 @employer_required
 def reject_application(application_id):
@@ -521,7 +493,6 @@ def reject_application(application_id):
             db.session.commit()
             flash(f"Application from {application.job_seeker.username} rejected.", "success")
             current_app.logger.info(f"Employer {current_user.id} rejected app {application_id}.")
-            # Send rejection email
             try:
                 applicant = application.job_seeker
                 if applicant and applicant.email:
@@ -545,14 +516,12 @@ def reject_application(application_id):
         current_app.logger.warning(f"App rejection form validation failed for app {application_id}: {validation_errors}")
     return redirect(url_for('employers.view_applications', job_id=job.id))
 
-
 @employers_bp.route('/applications/<int:application_id>/update_status', methods=['POST'])
 @employer_required
 def update_application_status(application_id):
     application = Application.query.get_or_404(application_id)
     job = application.job
 
-    # Security Check
     if job.employer_id != current_user.id:
         flash("Permission denied.", "danger")
         current_app.logger.warning(f"Unauthorized status update attempt: user {current_user.id}, app {application_id}")
@@ -562,20 +531,17 @@ def update_application_status(application_id):
     ALLOWED_UPDATE_STATUSES = ['Viewed', 'Shortlisted', 'Interviewing', 'Offer Made', 'Hired', 'Offer Declined']
     TERMINAL_STATUSES = ['Rejected', 'Hired', 'Offer Declined']
 
-    # Validate status
     if not new_status or new_status not in ALLOWED_UPDATE_STATUSES:
         flash(f"Invalid status '{new_status}' requested.", "danger")
         return redirect(url_for('employers.view_applications', job_id=job.id))
 
-    # Prevent updating from a terminal state via this route
     if application.status in TERMINAL_STATUSES:
         flash(f"Cannot update status. Application is already '{application.status}'.", "warning")
         return redirect(url_for('employers.view_applications', job_id=job.id))
 
-    # Update status and timestamp
     application.status = new_status
     application.status_updated_at = datetime.utcnow()
-    if application.status != 'Rejected': # Clear rejection reason if moving to non-rejected state
+    if application.status != 'Rejected':
          application.rejection_reason = None
 
     try:
@@ -583,7 +549,6 @@ def update_application_status(application_id):
         flash(f"Application status updated to '{new_status}'.", "success")
         current_app.logger.info(f"Employer {current_user.id} updated app {application_id} status to '{new_status}'.")
 
-        # Send Email Notification (Example for Offer Made)
         if new_status == 'Offer Made':
             try:
                 applicant = application.job_seeker
@@ -605,7 +570,6 @@ def update_application_status(application_id):
         current_app.logger.error(f"DB status update error for app {application_id}: {e}")
 
     return redirect(url_for('employers.view_applications', job_id=job.id))
-
 
 # --- Admin Routes ---
 @admin_bp.route('/dashboard')
@@ -635,7 +599,6 @@ def edit_user(user_id):
             flash(f"User '{user.username}' verification updated.", "success")
             current_app.logger.info(f"Admin {current_user.id} toggled verification for user {user.id}.")
             action_taken = True
-        # Add more actions here...
         if action_taken:
              return redirect(url_for('admin.manage_users'))
         else:
@@ -692,7 +655,6 @@ def approve_job(job_id):
         db.session.commit()
         flash(f'Job approved.', 'success')
         current_app.logger.info(f"Admin approved job {job_id}.")
-        # Send notification to employer
         try:
             employer = job.employer
             if employer and employer.email:
@@ -700,8 +662,7 @@ def approve_job(job_id):
                 job_url = url_for('jobs.job_detail', job_id=job.id, _external=True)
                 dashboard_url = url_for('employers.dashboard', _external=True)
                 text_body = f"Hello {employer.username},\n\nYour job '{job.title}' has been approved.\nView job: {job_url}\nManage: {dashboard_url}"
-                html_body = render_template('employers/email/job_approved_notification.html',
-                                            employer=employer, job=job, job_url=job_url, dashboard_url=dashboard_url)
+                html_body = render_template('employers/email/job_approved_notification.html', employer=employer, job=job, job_url=job_url, dashboard_url=dashboard_url)
                 send_email(subject, [employer.email], text_body, html_body)
                 current_app.logger.info(f"Sent job approval email to {employer.email}")
             else:
@@ -749,7 +710,6 @@ def admin_edit_job(job_id):
     form = JobForm(obj=job)
     if form.validate_on_submit():
         form.populate_obj(job)
-        # Admin edit policy
         try:
             db.session.commit()
             flash(f'Job updated by admin.', 'success')
@@ -759,7 +719,6 @@ def admin_edit_job(job_id):
             flash(f'Error updating job: {e}', 'danger')
             current_app.logger.error(f"Error updating job {job_id}: {e}")
         return redirect(url_for('admin.manage_jobs'))
-    # Create template admin/edit_job.html if needed
     flash("Admin job edit page not fully implemented.", "info")
     return redirect(url_for('admin.manage_jobs'))
 

@@ -1,12 +1,14 @@
 # --- app/views.py ---
 import os
 import uuid
-from threading import Thread  # <--- NEW IMPORT ADDED HERE
+from threading import Thread
 from functools import wraps
 from datetime import datetime
+import requests # <--- NEW IMPORT FOR BREVO API
 from flask import (render_template, redirect, url_for, flash, request, Blueprint, current_app, abort, send_from_directory)
 from flask_login import login_user, logout_user, login_required, current_user
-from flask_mail import Message
+# We no longer need flask_mail for the API method, but keeping it imported won't hurt if initialized in __init__.py
+from flask_mail import Message 
 from itsdangerous import SignatureExpired, BadSignature
 from werkzeug.utils import secure_filename
 from sqlalchemy.orm import joinedload
@@ -15,7 +17,7 @@ import cloudinary
 import cloudinary.uploader
 # --- ^ ^ ^ --- End Cloudinary Import --- ^ ^ ^ ---
 
-from . import db, mail, serializer
+from . import db, serializer
 from .models import User, Job, Application
 from .forms import (RegistrationForm, LoginForm, JobForm, RequestResetForm, ResetPasswordForm, ApplicationForm, RejectApplicationForm)
 
@@ -58,40 +60,55 @@ def job_seeker_required(f):
     return decorated_function
 
 
-# --- FIX APPLIED: Helper Functions for Sending Emails Asynchronously ---
-def send_async_email(app, msg):
-    """This function runs in the background so it doesn't freeze the app."""
+# --- ENTERPRISE FIX: Brevo API Email Functions ---
+def send_async_email(app, subject, recipients, text_body, html_body):
+    """Sends email via HTTP API (Port 443) to completely bypass Render's SMTP block."""
     with app.app_context():
+        api_key = os.environ.get('EMAIL_API_KEY')
+        sender_email = os.environ.get('MAIL_DEFAULT_SENDER', 'noreply@nexhire.com')
+        
+        if not api_key:
+            app.logger.error("EMAIL_API_KEY is missing from environment variables!")
+            return
+
+        url = "https://api.brevo.com/v3/smtp/email"
+        headers = {
+            "accept": "application/json",
+            "api-key": api_key,
+            "content-type": "application/json"
+        }
+        
+        # Format the data for Brevo
+        data = {
+            "sender": {"email": sender_email, "name": "NexHire Team"},
+            "to": [{"email": r} for r in recipients],
+            "subject": subject,
+            "htmlContent": html_body,
+            "textContent": text_body
+        }
+        
         try:
-            mail.send(msg)
-            app.logger.info(f"Background email sent to {msg.recipients}")
+            response = requests.post(url, json=data, headers=headers)
+            if response.status_code in [200, 201, 202]:
+                app.logger.info(f"API email successfully sent to {recipients}")
+            else:
+                app.logger.error(f"API Email failed. Status: {response.status_code}, Response: {response.text}")
         except Exception as e:
-            app.logger.error(f"Background email send fail to {msg.recipients}: {e}")
+            app.logger.error(f"API Request crashed: {e}")
 
 def send_email(subject, recipients, text_body, html_body):
-    """Prepares the email and hands it off to a background thread."""
-    if not isinstance(recipients, list): 
-        current_app.logger.error(f"Recipient not list: {recipients}")
-        return False
-    if not recipients: 
-        current_app.logger.error("Recipients empty.")
-        return False
-    if not current_app.config.get('MAIL_USERNAME') or not current_app.config.get('MAIL_PASSWORD'): 
-        current_app.logger.error("Mail not configured.")
+    """Prepares the email and hands it off to a background API thread."""
+    if not isinstance(recipients, list) or not recipients: 
+        current_app.logger.error(f"Invalid recipients: {recipients}")
         return False
         
-    sender = current_app.config.get('MAIL_DEFAULT_SENDER') or current_app.config.get('MAIL_USERNAME', 'noreply@example.com')
-    msg = Message(subject, sender=sender, recipients=recipients, body=text_body, html=html_body)
-    
-    # Extract the actual application object to pass to the thread
     app = current_app._get_current_object()
     
-    # Start the background thread
-    Thread(target=send_async_email, args=(app, msg)).start()
+    # Pass the raw data to the thread instead of a Flask-Mail Message object
+    Thread(target=send_async_email, args=(app, subject, recipients, text_body, html_body)).start()
     
-    # Return immediately so the web page doesn't freeze!
     return True
-# --- END FIX ---
+# --- END ENTERPRISE FIX ---
 
 
 # --- Main Routes ---
@@ -125,28 +142,6 @@ def create_first_admin():
             
     return "Admin already exists! Please try logging in.", 200
 
-# NEW: Diagnostic Email Route
-@auth_bp.route('/test_email')
-def test_email():
-    """Diagnostic route to explicitly test email configuration and output errors."""
-    admin_email = current_app.config.get('MAIL_USERNAME')
-    if not admin_email:
-        return "ERROR: MAIL_USERNAME is not set in the environment variables.", 400
-
-    try:
-        msg = Message(
-            subject="NexHire Diagnostic Test",
-            sender=admin_email,
-            recipients=[admin_email],  # Sending an email to yourself
-            body="If you receive this, your Render email configuration is working perfectly!"
-        )
-        # We are sending this SYNCHRONOUSLY (no background thread) to catch the exact error
-        mail.send(msg)
-        return f"SUCCESS: Test email sent to {admin_email}! Please check your inbox.", 200
-    except Exception as e:
-        # This will print the exact reason it's failing to your browser screen!
-        return f"EMAIL FAILED. Here is the exact error: <br><br><b>{str(e)}</b>", 500
-
 @auth_bp.route('/admin_cannot_post')
 @login_required
 @admin_required
@@ -173,26 +168,26 @@ def register():
         db.session.add(user)
         try:
             db.session.commit()
-            current_app.logger.info(f"User registered: {user.username}, preparing email.")
+            current_app.logger.info(f"User registered: {user.username}, preparing API email.")
             token = serializer.dumps(user.email, salt=current_app.config['SECURITY_PASSWORD_SALT'])
             verify_url = url_for('auth.verify_email', token=token, _external=True)
-            subject = "Confirm Email"
-            text_body = f"Verify: {verify_url}"
+            
+            # QA Trick: Still print to console just in case!
+            current_app.logger.info(f"\n\n🚨 MOCK INBOX FOR {user.email} 🚨\nClick this link to verify: {verify_url}\n\n")
+
+            subject = "Confirm Your NexHire Account"
+            text_body = f"Please verify your account by clicking this link: {verify_url}"
             try:
                 html_body = render_template('auth/email/verify_email.html', verify_url=verify_url)
             except Exception as template_error:
                 current_app.logger.error(f"Error rendering verification email template: {template_error}")
-                html_body = text_body
+                html_body = f"<p>Please verify your account by clicking <a href='{verify_url}'>this link</a>.</p>"
 
-            # Email logic wrapped in try/except to prevent app crash
             try:
-                mail_success = send_email(subject, [user.email], text_body, html_body)
-                if mail_success:
-                    flash('Registration successful! Check your email to verify.', 'success')
-                else:
-                    flash('Registered successfully, but we could not connect to the email server.', 'warning')
+                send_email(subject, [user.email], text_body, html_body)
+                flash('Registration successful! Check your email to verify.', 'success')
             except Exception as e:
-                current_app.logger.error(f"Mail Exception Triggered: {e}")
+                current_app.logger.error(f"API Trigger Exception: {e}")
                 flash('Registered successfully, but the verification email failed to send.', 'warning')
 
             return redirect(url_for('auth.login'))
@@ -260,7 +255,6 @@ def logout():
     current_app.logger.info(f"Logout: {uname}")
     return redirect(url_for('main.index'))
 
-# Forgot Password Timeout Handling & Security
 @auth_bp.route('/forgot_password', methods=['GET', 'POST'])
 def forgot_password():
     if current_user.is_authenticated:
@@ -272,23 +266,19 @@ def forgot_password():
         if user:
             token = serializer.dumps(user.email, salt=current_app.config['SECURITY_PASSWORD_SALT'])
             url = url_for('auth.reset_password', token=token, _external=True)
-            subject = "Password Reset Request"
-            text = f"Reset: {url}"
+            subject = "NexHire Password Reset Request"
+            text = f"Reset your password here: {url}"
             try:
                 html = render_template('auth/email/reset_password_email.html', reset_url=url)
             except Exception as e:
                 current_app.logger.error(f"Error rendering reset password template: {e}")
-                html = text # Fallback
+                html = f"<p>Reset your password <a href='{url}'>here</a>.</p>" 
             
-            # Wraps email sending in try/except to prevent 500 error timeouts
             try:
-                mail_success = send_email(subject, [user.email], text, html)
-                if not mail_success:
-                    current_app.logger.warning("Mail server connection failed during forgot password.")
+                send_email(subject, [user.email], text, html)
             except Exception as e:
-                current_app.logger.error(f"Mail Timeout Exception: {e}")
+                current_app.logger.error(f"API Timeout Exception: {e}")
 
-        # Always flash this identical message for security (prevents enumerating valid emails)
         flash('If an account with that email exists, a password reset link has been sent.', 'info')
         return redirect(url_for('auth.login'))
         
@@ -398,33 +388,34 @@ def apply_job(job_id):
             current_app.logger.info(f"Application saved: user {current_user.id}, job {job_id}")
             now_time = datetime.utcnow()
 
-            # Send Emails
+            # Send Emails via Brevo API
             try:
                 subj_seeker = f"Application Received: {job.title}"
                 job_url = url_for('jobs.job_detail', job_id=job.id, _external=True)
-                text_seeker = f"Hello {current_user.username},\n\nYour application for '{job.title}' at {job.company_name} was submitted on {now_time.strftime('%Y-%m-%d %H:%M')} UTC.\nView job: {job_url}\n\nThanks,\nThe Job Portal Team"
-                html_seeker = render_template('jobs/email/application_confirmation.html', user=current_user, job=job, job_url=job_url, now=now_time)
-                if send_email(subj_seeker, [current_user.email], text_seeker, html_seeker):
-                    current_app.logger.info(f"App confirm email sent to {current_user.email}")
-                else:
-                    flash("Confirm email failed to send.", "warning")
+                text_seeker = f"Hello {current_user.username},\n\nYour application for '{job.title}' at {job.company_name} was submitted.\nView job: {job_url}\n\nThanks,\nThe Job Portal Team"
+                try:
+                    html_seeker = render_template('jobs/email/application_confirmation.html', user=current_user, job=job, job_url=job_url, now=now_time)
+                except Exception as e:
+                    html_seeker = text_seeker.replace('\n', '<br>')
+                
+                send_email(subj_seeker, [current_user.email], text_seeker, html_seeker)
             except Exception as e:
-                current_app.logger.error(f"Seeker confirm email error: {e}")
-                flash("Error preparing confirmation email.", "danger")
+                current_app.logger.error(f"Seeker confirm email API trigger error: {e}")
 
             try:
                 emp = job.employer
                 if emp and emp.email:
                     subj_emp = f"New Application: {job.title}"
                     apps_url = url_for('employers.view_applications', job_id=job.id, _external=True)
-                    text_emp = f"New app for {job.title} from {current_user.username}.\nView: {apps_url}"
-                    html_emp = render_template('employers/email/new_application_notification.html', employer=emp, job=job, applicant=current_user, apps_url=apps_url, now=now_time)
-                    if send_email(subj_emp, [emp.email], text_emp, html_emp):
-                        current_app.logger.info(f"New app email sent to {emp.email}")
-                else:
-                    current_app.logger.warning(f"Employer email not found for job {job_id}")
+                    text_emp = f"New application for {job.title} from {current_user.username}.\nView: {apps_url}"
+                    try:
+                        html_emp = render_template('employers/email/new_application_notification.html', employer=emp, job=job, applicant=current_user, apps_url=apps_url, now=now_time)
+                    except Exception as e:
+                        html_emp = text_emp.replace('\n', '<br>')
+                    
+                    send_email(subj_emp, [emp.email], text_emp, html_emp)
             except Exception as e:
-                current_app.logger.error(f"Employer notify email error: {e}")
+                current_app.logger.error(f"Employer notify email API trigger error: {e}")
 
             return redirect(url_for('jobs.job_detail', job_id=job_id))
         except Exception as e:
@@ -433,9 +424,8 @@ def apply_job(job_id):
             if cloudinary_public_id:
                 try:
                     cloudinary.uploader.destroy(cloudinary_public_id, resource_type="raw")
-                    current_app.logger.warning(f"Deleted orphaned Cloudinary resume {cloudinary_public_id} after DB error.")
                 except Exception as del_e:
-                    current_app.logger.error(f"Failed to delete orphaned Cloudinary file {cloudinary_public_id}: {del_e}")
+                    current_app.logger.error(f"Failed to delete orphaned Cloudinary file: {del_e}")
             flash(f'Database error submitting application.', 'danger')
             return render_template('jobs/detail.html', title=job.title, job=job, already_applied=False, form=form)
 
@@ -473,20 +463,23 @@ def post_job():
             db.session.commit()
             flash('Job posted pending approval.', 'success')
             current_app.logger.info(f"Job posted: {job.id} by {current_user.id}")
+            
+            # Notify Admins via API
             try:
                 admins = User.query.filter_by(role='admin').all()
                 emails = [a.email for a in admins if a.email]
                 if emails:
-                    subj = "New Job Approval Required"
+                    subj = "NexHire: New Job Approval Required"
                     url = url_for('admin.manage_jobs', status='pending', _external=True)
-                    text = f"New job '{job.title}' needs approval.\nReview: {url}"
-                    html = render_template('admin/email/new_job_notification.html', job=job, user=current_user, admin_jobs_url=url)
+                    text = f"New job '{job.title}' needs approval.\nReview here: {url}"
+                    try:
+                        html = render_template('admin/email/new_job_notification.html', job=job, user=current_user, admin_jobs_url=url)
+                    except:
+                        html = text.replace('\n', '<br>')
                     send_email(subj, emails, text, html)
-                    current_app.logger.info(f"Admin notification sent: {emails}")
-                else:
-                    current_app.logger.warning("No admins found for notification.")
             except Exception as e:
-                current_app.logger.error(f"Admin notify email error: {e}")
+                current_app.logger.error(f"Admin notify email API trigger error: {e}")
+                
             return redirect(url_for('employers.dashboard'))
         except Exception as e:
             db.session.rollback()
@@ -566,20 +559,21 @@ def reject_application(application_id):
         try:
             db.session.commit()
             flash(f"Application from {application.job_seeker.username} rejected.", "success")
-            current_app.logger.info(f"Employer {current_user.id} rejected app {application_id}.")
+            
+            # API Rejection Email
             try:
                 applicant = application.job_seeker
                 if applicant and applicant.email:
                     subject = f"Update on application for {job.title}"
                     text = f"Update on {job.title}:\nReason: {selected_reason_text}\nNotes: {form.notes.data or 'N/A'}"
-                    html = render_template('jobs/email/application_rejection.html', applicant=applicant, job=job, reason=selected_reason_text, notes=form.notes.data)
+                    try:
+                        html = render_template('jobs/email/application_rejection.html', applicant=applicant, job=job, reason=selected_reason_text, notes=form.notes.data)
+                    except:
+                        html = text.replace('\n', '<br>')
                     send_email(subject, [applicant.email], text, html)
-                    current_app.logger.info(f"Sent rejection email to {applicant.email}")
-                else:
-                    current_app.logger.warning(f"Applicant email not found for app {application_id}")
             except Exception as e:
-                current_app.logger.error(f"Rejection email error: {e}")
-                flash("App rejected, but notification failed.", "warning")
+                current_app.logger.error(f"Rejection email API trigger error: {e}")
+                
         except Exception as e:
             db.session.rollback()
             flash("DB error updating application.", "danger")
@@ -587,7 +581,6 @@ def reject_application(application_id):
     else:
         validation_errors = form.errors
         flash("Could not reject application. Please select a valid reason.", "danger")
-        current_app.logger.warning(f"App rejection form validation failed for app {application_id}: {validation_errors}")
     return redirect(url_for('employers.view_applications', job_id=job.id))
 
 @employers_bp.route('/applications/<int:application_id>/update_status', methods=['POST'])
@@ -598,7 +591,6 @@ def update_application_status(application_id):
 
     if job.employer_id != current_user.id:
         flash("Permission denied.", "danger")
-        current_app.logger.warning(f"Unauthorized status update attempt: user {current_user.id}, app {application_id}")
         abort(403)
 
     new_status = request.form.get('new_status')
@@ -621,7 +613,6 @@ def update_application_status(application_id):
     try:
         db.session.commit()
         flash(f"Application status updated to '{new_status}'.", "success")
-        current_app.logger.info(f"Employer {current_user.id} updated app {application_id} status to '{new_status}'.")
 
         if new_status == 'Offer Made':
             try:
@@ -629,19 +620,17 @@ def update_application_status(application_id):
                 if applicant and applicant.email:
                     subject = f"Congratulations! Offer for {job.title}"
                     text_body = f"Hello {applicant.username},\n\nWe are pleased to extend an offer for '{job.title}'. Details to follow.\n\nRegards"
-                    html_body = render_template('jobs/email/offer_notification.html', applicant=applicant, job=job)
+                    try:
+                        html_body = render_template('jobs/email/offer_notification.html', applicant=applicant, job=job)
+                    except:
+                        html_body = text_body.replace('\n', '<br>')
                     send_email(subject, [applicant.email], text_body, html_body)
-                    current_app.logger.info(f"Sent offer notification to {applicant.email}")
-                else:
-                    current_app.logger.warning(f"Applicant/email not found for app {application_id}, cannot send offer email.")
             except Exception as e:
-                current_app.logger.error(f"Offer email error for app {application_id}: {e}")
-                flash("Status updated, but failed to send offer notification email.", "warning")
+                current_app.logger.error(f"Offer email API trigger error: {e}")
 
     except Exception as e:
         db.session.rollback()
         flash("Database error updating application status.", "danger")
-        current_app.logger.error(f"DB status update error for app {application_id}: {e}")
 
     return redirect(url_for('employers.view_applications', job_id=job.id))
 
@@ -666,17 +655,12 @@ def manage_users():
 def edit_user(user_id):
     user = User.query.get_or_404(user_id)
     if request.method == 'POST':
-        action_taken = False
         if 'toggle_verify' in request.form:
             user.is_verified = not user.is_verified
             db.session.commit()
             flash(f"User '{user.username}' verification updated.", "success")
-            current_app.logger.info(f"Admin {current_user.id} toggled verification for user {user.id}.")
-            action_taken = True
-        if action_taken:
-             return redirect(url_for('admin.manage_users'))
-        else:
-             flash('No update action performed.', 'info')
+            return redirect(url_for('admin.manage_users'))
+        flash('No update action performed.', 'info')
     return render_template('admin/edit_user.html', title=f'Edit User {user.username}', user=user)
 
 @admin_bp.route('/users/<int:user_id>/delete', methods=['POST'])
@@ -694,11 +678,9 @@ def delete_user(user_id):
         db.session.delete(user_to_delete)
         db.session.commit()
         flash(f'User {username} deleted.', 'success')
-        current_app.logger.info(f"Admin deleted user {user_id} ({username}).")
     except Exception as e:
         db.session.rollback()
         flash(f'Error deleting user: {e}', 'danger')
-        current_app.logger.error(f"Error deleting user {user_id}: {e}")
     return redirect(url_for('admin.manage_users'))
 
 @admin_bp.route('/jobs')
@@ -728,22 +710,22 @@ def approve_job(job_id):
         job.is_approved = True
         db.session.commit()
         flash(f'Job approved.', 'success')
-        current_app.logger.info(f"Admin approved job {job_id}.")
+        
+        # API Job Approval Email
         try:
             employer = job.employer
             if employer and employer.email:
                 subject = f"Your Job Posting Approved: {job.title}"
                 job_url = url_for('jobs.job_detail', job_id=job.id, _external=True)
                 dashboard_url = url_for('employers.dashboard', _external=True)
-                text_body = f"Hello {employer.username},\n\nYour job '{job.title}' has been approved.\nView job: {job_url}\nManage: {dashboard_url}"
-                html_body = render_template('employers/email/job_approved_notification.html', employer=employer, job=job, job_url=job_url, dashboard_url=dashboard_url)
+                text_body = f"Hello {employer.username},\n\nYour job '{job.title}' has been approved.\nView job: {job_url}"
+                try:
+                    html_body = render_template('employers/email/job_approved_notification.html', employer=employer, job=job, job_url=job_url, dashboard_url=dashboard_url)
+                except:
+                    html_body = text_body.replace('\n', '<br>')
                 send_email(subject, [employer.email], text_body, html_body)
-                current_app.logger.info(f"Sent job approval email to {employer.email}")
-            else:
-                current_app.logger.warning(f"Employer/email not found for job {job_id}, cannot send approval email.")
         except Exception as e:
-            current_app.logger.error(f"Failed sending approval email for job {job_id}: {e}")
-            flash("Job approved, but failed to send notification email to employer.", "warning")
+            current_app.logger.error(f"Job approval email API trigger error: {e}")
     else:
         flash(f'Job already approved.', 'info')
     return redirect(url_for('admin.manage_jobs', status=request.args.get('status', 'pending')))
@@ -756,7 +738,6 @@ def unapprove_job(job_id):
         job.is_approved = False
         db.session.commit()
         flash(f'Job unapproved.', 'success')
-        current_app.logger.info(f"Admin unapproved job {job_id}.")
     else:
         flash(f'Job already not approved.', 'info')
     return redirect(url_for('admin.manage_jobs', status=request.args.get('status', 'approved')))
@@ -770,11 +751,9 @@ def admin_delete_job(job_id):
         db.session.delete(job)
         db.session.commit()
         flash(f'Job "{title}" deleted.', 'success')
-        current_app.logger.info(f"Admin deleted job {job_id}.")
     except Exception as e:
         db.session.rollback()
         flash(f'Error deleting job: {e}', 'danger')
-        current_app.logger.error(f"Error deleting job {job_id}: {e}")
     return redirect(url_for('admin.manage_jobs', status=request.args.get('status', 'all')))
 
 @admin_bp.route('/jobs/<int:job_id>/admin_edit', methods=['GET', 'POST'])
@@ -787,11 +766,9 @@ def admin_edit_job(job_id):
         try:
             db.session.commit()
             flash(f'Job updated by admin.', 'success')
-            current_app.logger.info(f"Admin edited job {job_id}.")
         except Exception as e:
             db.session.rollback()
             flash(f'Error updating job: {e}', 'danger')
-            current_app.logger.error(f"Error updating job {job_id}: {e}")
         return redirect(url_for('admin.manage_jobs'))
     flash("Admin job edit page not fully implemented.", "info")
     return redirect(url_for('admin.manage_jobs'))

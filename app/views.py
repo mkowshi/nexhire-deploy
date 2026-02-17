@@ -78,6 +78,30 @@ def index():
     return render_template('index.html', jobs=recent_jobs)
 
 # --- Authentication Routes ---
+
+# FIX 1: The Temporary Admin Creation Route (Phase 6 Workaround)
+@auth_bp.route('/create_first_admin')
+def create_first_admin():
+    email = os.environ.get('DEFAULT_ADMIN_EMAIL')
+    password = os.environ.get('DEFAULT_ADMIN_PASSWORD')
+    
+    if not email or not password:
+        return "Error: DEFAULT_ADMIN_EMAIL or DEFAULT_ADMIN_PASSWORD missing in Render Environment.", 400
+        
+    admin = User.query.filter_by(email=email).first()
+    if not admin:
+        new_admin = User(username='SuperAdmin', email=email, role='admin', is_verified=True)
+        new_admin.set_password(password)
+        try:
+            db.session.add(new_admin)
+            db.session.commit()
+            return f"Admin {email} successfully created! You can now log in.", 200
+        except Exception as e:
+            db.session.rollback()
+            return f"Database error: {e}", 500
+            
+    return "Admin already exists! Please try logging in.", 200
+
 @auth_bp.route('/admin_cannot_post')
 @login_required
 @admin_required
@@ -115,7 +139,7 @@ def register():
                 current_app.logger.error(f"Error rendering verification email template: {template_error}")
                 html_body = text_body
 
-            # FIX APPLIED HERE: Restructured email logic to prevent app crash
+            # Email logic wrapped in try/except to prevent app crash
             try:
                 mail_success = send_email(subject, [user.email], text_body, html_body)
                 if mail_success:
@@ -191,6 +215,7 @@ def logout():
     current_app.logger.info(f"Logout: {uname}")
     return redirect(url_for('main.index'))
 
+# FIX 2: Forgot Password Timeout Handling & Security
 @auth_bp.route('/forgot_password', methods=['GET', 'POST'])
 def forgot_password():
     if current_user.is_authenticated:
@@ -198,7 +223,7 @@ def forgot_password():
     form = RequestResetForm()
     if form.validate_on_submit():
         user = User.query.filter_by(email=form.email.data.lower()).first()
-        sent = False
+        
         if user:
             token = serializer.dumps(user.email, salt=current_app.config['SECURITY_PASSWORD_SALT'])
             url = url_for('auth.reset_password', token=token, _external=True)
@@ -208,16 +233,20 @@ def forgot_password():
                 html = render_template('auth/email/reset_password_email.html', reset_url=url)
             except Exception as e:
                 current_app.logger.error(f"Error rendering reset password template: {e}")
-                html = text
-            if send_email(subject, [user.email], text, html):
-                sent = True
-            else:
-                flash('Failed to send reset email.', 'danger')
-        if sent:
-            flash('Reset link sent.', 'info')
-        elif not user:
-            flash('If account exists, link sent.', 'info')
+                html = text # Fallback
+            
+            # Wraps email sending in try/except to prevent 500 error timeouts
+            try:
+                mail_success = send_email(subject, [user.email], text, html)
+                if not mail_success:
+                    current_app.logger.warning("Mail server connection failed during forgot password.")
+            except Exception as e:
+                current_app.logger.error(f"Mail Timeout Exception: {e}")
+
+        # Always flash this identical message for security (prevents enumerating valid emails)
+        flash('If an account with that email exists, a password reset link has been sent.', 'info')
         return redirect(url_for('auth.login'))
+        
     return render_template('auth/forgot_password.html', title='Forgot Password', form=form)
 
 @auth_bp.route('/reset_password/<token>', methods=['GET', 'POST'])

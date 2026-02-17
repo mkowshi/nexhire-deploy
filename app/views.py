@@ -125,6 +125,28 @@ def create_first_admin():
             
     return "Admin already exists! Please try logging in.", 200
 
+# NEW: Diagnostic Email Route
+@auth_bp.route('/test_email')
+def test_email():
+    """Diagnostic route to explicitly test email configuration and output errors."""
+    admin_email = current_app.config.get('MAIL_USERNAME')
+    if not admin_email:
+        return "ERROR: MAIL_USERNAME is not set in the environment variables.", 400
+
+    try:
+        msg = Message(
+            subject="NexHire Diagnostic Test",
+            sender=admin_email,
+            recipients=[admin_email],  # Sending an email to yourself
+            body="If you receive this, your Render email configuration is working perfectly!"
+        )
+        # We are sending this SYNCHRONOUSLY (no background thread) to catch the exact error
+        mail.send(msg)
+        return f"SUCCESS: Test email sent to {admin_email}! Please check your inbox.", 200
+    except Exception as e:
+        # This will print the exact reason it's failing to your browser screen!
+        return f"EMAIL FAILED. Here is the exact error: <br><br><b>{str(e)}</b>", 500
+
 @auth_bp.route('/admin_cannot_post')
 @login_required
 @admin_required

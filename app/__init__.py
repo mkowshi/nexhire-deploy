@@ -45,6 +45,8 @@ def create_app(config_class=None):
         MAIL_USERNAME=os.environ.get('MAIL_USERNAME'),
         MAIL_PASSWORD=os.environ.get('MAIL_PASSWORD'),
         MAIL_DEFAULT_SENDER=os.environ.get('MAIL_DEFAULT_SENDER', 'noreply@example.com'),
+        # --- FIX APPLIED HERE: 5 Second Mail Timeout ---
+        MAIL_TIMEOUT=5,
     )
 
     # Ensure Instance Folder Exists

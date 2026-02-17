@@ -1,6 +1,7 @@
 # --- app/views.py ---
 import os
 import uuid
+from threading import Thread  # <--- NEW IMPORT ADDED HERE
 from functools import wraps
 from datetime import datetime
 from flask import (render_template, redirect, url_for, flash, request, Blueprint, current_app, abort, send_from_directory)
@@ -56,20 +57,42 @@ def job_seeker_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
-# --- Helper Function for Sending Emails ---
+
+# --- FIX APPLIED: Helper Functions for Sending Emails Asynchronously ---
+def send_async_email(app, msg):
+    """This function runs in the background so it doesn't freeze the app."""
+    with app.app_context():
+        try:
+            mail.send(msg)
+            app.logger.info(f"Background email sent to {msg.recipients}")
+        except Exception as e:
+            app.logger.error(f"Background email send fail to {msg.recipients}: {e}")
+
 def send_email(subject, recipients, text_body, html_body):
-    if not isinstance(recipients, list): current_app.logger.error(f"Recipient not list: {recipients}"); return False
-    if not recipients: current_app.logger.error("Recipients empty."); return False
-    if not current_app.config.get('MAIL_USERNAME') or not current_app.config.get('MAIL_PASSWORD'): current_app.logger.error("Mail not configured."); return False
+    """Prepares the email and hands it off to a background thread."""
+    if not isinstance(recipients, list): 
+        current_app.logger.error(f"Recipient not list: {recipients}")
+        return False
+    if not recipients: 
+        current_app.logger.error("Recipients empty.")
+        return False
+    if not current_app.config.get('MAIL_USERNAME') or not current_app.config.get('MAIL_PASSWORD'): 
+        current_app.logger.error("Mail not configured.")
+        return False
+        
     sender = current_app.config.get('MAIL_DEFAULT_SENDER') or current_app.config.get('MAIL_USERNAME', 'noreply@example.com')
     msg = Message(subject, sender=sender, recipients=recipients, body=text_body, html=html_body)
-    try:
-        mail.send(msg)
-        current_app.logger.info(f"Email sent to {recipients}")
-        return True
-    except Exception as e:
-        current_app.logger.error(f"Email send fail to {recipients}: {e}")
-        return False
+    
+    # Extract the actual application object to pass to the thread
+    app = current_app._get_current_object()
+    
+    # Start the background thread
+    Thread(target=send_async_email, args=(app, msg)).start()
+    
+    # Return immediately so the web page doesn't freeze!
+    return True
+# --- END FIX ---
+
 
 # --- Main Routes ---
 @main_bp.route('/')
@@ -79,7 +102,7 @@ def index():
 
 # --- Authentication Routes ---
 
-# FIX 1: The Temporary Admin Creation Route (Phase 6 Workaround)
+# The Temporary Admin Creation Route (Phase 6 Workaround)
 @auth_bp.route('/create_first_admin')
 def create_first_admin():
     email = os.environ.get('DEFAULT_ADMIN_EMAIL')
@@ -215,7 +238,7 @@ def logout():
     current_app.logger.info(f"Logout: {uname}")
     return redirect(url_for('main.index'))
 
-# FIX 2: Forgot Password Timeout Handling & Security
+# Forgot Password Timeout Handling & Security
 @auth_bp.route('/forgot_password', methods=['GET', 'POST'])
 def forgot_password():
     if current_user.is_authenticated:

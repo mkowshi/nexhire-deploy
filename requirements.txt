@@ -13,3 +13,7 @@ gunicorn
 whitenoise[brotli]
 cloudinary
 Flask-Migrate
+requests
+
+
+
